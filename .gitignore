@@ -1,0 +1,36 @@
+# ===== Java / Maven =====
+target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/
+mvnw
+mvnw.cmd
+
+# ===== IDE =====
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== 日志 / 临时 =====
+*.log
+*.tmp
+*.swp
+*.bak
+
+# ===== Outbox 文档里示例项目的虚拟产物（后续真要写代码时再删这些行） =====
+outbox-demo/target/
+outbox-demo/*.log
+
+# ===== Cursor Agent 内部目录 =====
+.agents/
