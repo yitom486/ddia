@@ -1,9 +1,10 @@
 # disruptor-lab
 
-`docs/mq-learning/Disruptor详解.md` 的配套可运行 demo。两个实验，分别验证文档里两个最关键的论断：
+`docs/mq-learning/Disruptor详解.md` 的配套可运行 demo。三个实验，分别验证文档里三个最关键的论断：
 
 1. **单生产者模式完全不用 CAS** — `singleproducer/`
 2. **伪共享会带来 6-7 倍性能差距** — `falsesharing/`
+3. **单生产者 vs 多生产者 直接对比** — `compare/`
 
 ## 环境
 
@@ -79,6 +80,42 @@ mvn -q exec:java -Dexec.mainClass=io.ddia.disruptor.lab.falsesharing.ObjectLayou
 
 > 想看更"真实"的偏移可加 `-XX:-UseCompressedOops` 关闭压缩指针。
 
+## 实验 3：单生产者 vs 多生产者 直接对比
+
+控制变量（两边完全相同）：bufferSize、消息总数、消费者线程数、消息体、warm-up 策略。
+自变量：生产者线程数（1 vs 4）+ 对应 Sequencer 实现。
+
+> 注意：下面的命令默认你**已经在 `code/disruptor-lab/` 目录里**。如果从仓库根 `/home/tomy/projects/java/ddia` 跑，要在前面加 `-f code/disruptor-lab/pom.xml`，否则 Maven 会报 *"there is no POM in this directory"*。
+>
+> 如果是**新加的类**（比如对比 demo 这种），先跑一遍 `mvn compile` 把新类编译进 `target/classes`，否则 exec 会报 `ClassNotFoundException`：
+
+```
+# 方式 A（推荐，仓库根可直接跑）
+mvn -q -f code/disruptor-lab/pom.xml compile exec:java -Dexec.mainClass=io.ddia.disruptor.lab.compare.SingleVsMultiProducerDemo
+
+# 方式 B（先 cd 再跑）
+cd code/disruptor-lab
+mvn -q compile exec:java -Dexec.mainClass=io.ddia.disruptor.lab.compare.SingleVsMultiProducerDemo
+```
+
+预期看到（实际数字依机器而异，关键看**比值**）：
+
+```
+┌─────────────┬──────────────┬──────────────┐
+│     指标    │  单生产者     │  多生产者(4)  │
+├─────────────┼──────────────┼──────────────┤
+│ 吞吐 Mops/s │        12.34 │         4.56 │
+│ CAS 次数    │             0 │    40,000,000 │
+│ CAS/消息    │         0.000 │         1.333 │
+└─────────────┴──────────────┴──────────────┘
+吞吐量比值：单 / 多 ≈ 2.7x
+```
+
+**怎么看这个表**：
+- `CAS 次数`：单生产者永远 0；多生产者 ≥ 消息总数（每次 `next()` 至少 1 次 CAS，冲突时会更多）
+- `CAS/消息`：多生产者的核心成本指标。比值 ≈ 1 是"完全无冲突"，比值 > 1 是"有 CAS 重试"
+- 吞吐倍数差：单生产者的 publisher 路径只有 1 次 volatile 写，多生产者要 1 次 CAS（`lock cmpxchg`），后者在 x86 上多一道 cache 同步成本
+
 ## 目录结构
 
 ```
@@ -89,6 +126,15 @@ disruptor-lab/
     │   ├── Sequence.java                 # 带 cache line padding 的 volatile long
     │   ├── SingleProducerSequencer.java  # 零 CAS 序号分配器（核心）
     │   └── MiniSingleProducerDemo.java   # 可运行 demo + 计数器证明
+    ├── multiproducer/                    # 早期写出的多生产者参考实现（独立目录）
+    │   ├── MultiProducerSequencer.java
+    │   └── MiniMultiProducerDemo.java
+    ├── compare/                          # 单 vs 多 直接对比
+    │   ├── Sequencer.java                # 抽象接口
+    │   ├── Sequence.java
+    │   ├── SingleProducerSequencer.java  # implements Sequencer
+    │   ├── MultiProducerSequencer.java   # implements Sequencer
+    │   └── SingleVsMultiProducerDemo.java
     └── falsesharing/
         ├── FalseSharingBench.java        # JMH 基准：Plain vs Padded
         └── ObjectLayoutDemo.java         # JOL 打印字段偏移

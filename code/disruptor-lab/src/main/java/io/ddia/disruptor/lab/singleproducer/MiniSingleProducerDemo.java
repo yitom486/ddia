@@ -103,6 +103,9 @@ public class MiniSingleProducerDemo {
         BatchEventProcessor<Long> consumer = new BatchEventProcessor<>(
                 ring, sequencer, consumerCursor,
                 (event, sequence, endOfBatch) -> {
+                    if((sequence & 0xFFFFF) == 0) {
+                        System.out.println("消费到消息 @ " + sequence);
+                    }
                     if (event == null) {
                         throw new IllegalStateException("消费到 null @ " + sequence);
                     }
