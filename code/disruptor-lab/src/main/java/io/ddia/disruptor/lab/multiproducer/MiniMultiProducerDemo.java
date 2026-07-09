@@ -1,5 +1,6 @@
 package io.ddia.disruptor.lab.multiproducer;
 
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -21,15 +22,62 @@ public class MiniMultiProducerDemo {
         volatile long sequence = Sequence.INITIAL;    // -1 = 未发布；>=0 = 发布时的序号
     }
 
+    /**
+     * 关键差异（解决 Entry 复用被覆盖的 bug）：
+     *   仅靠 Entry.sequence 是不够的。因为 bufferSize=1024 远小于总消息数 15 万，
+     *   同一个 Entry 会被生产者写多次，Entry.sequence 会被覆盖成最新的 seq。
+     *   消费者想消费 seq=1 时，Entry[1].sequence 早已被覆盖成 1025、2049 ... 149505。
+     *   解决方案：用 availableBuffer 记录每个 seq 是否已发布，bit=1 表示已发布。
+     *   消费者查 bit 而不是读 Entry.sequence，避免被覆盖后的"假阳性"。
+     */
+    static final class AvailableBuffer {
+        final int capacity;   // 能记录的序号上限
+        // 用 AtomicLongArray 保证 set/clear 对消费者是 happens-before 可见的
+        final AtomicLongArray bits;
+        AvailableBuffer(int capacity) {
+            this.capacity = capacity;
+            this.bits = new AtomicLongArray((capacity + 63) >>> 6);
+        }
+        void set(long seq) {
+            int idx = (int) (seq >>> 6);
+            long mask = 1L << (int) (seq & 63);
+            // get + CAS（不同线程可能并发 set 同一个 word）
+            while (true) {
+                long old = bits.get(idx);
+                long newV = old | mask;
+                if (old == newV) return;     // 已经 set 过
+                if (bits.compareAndSet(idx, old, newV)) return;
+            }
+        }
+        boolean isAvailable(long seq) {
+            int idx = (int) (seq >>> 6);
+            long mask = 1L << (int) (seq & 63);
+            return (bits.get(idx) & mask) != 0;
+        }
+        void clear(long seq) {
+            int idx = (int) (seq >>> 6);
+            long mask = 1L << (int) (seq & 63);
+            while (true) {
+                long old = bits.get(idx);
+                long newV = old & ~mask;
+                if (old == newV) return;
+                if (bits.compareAndSet(idx, old, newV)) return;
+            }
+        }
+    }
+
     static final class RingBuffer<T> {
         final Entry<T>[] entries;
         final MultiProducerSequencer sequencer;
+        final AvailableBuffer available;   // 新增：记录每个 seq 是否已发布
 
         @SuppressWarnings("unchecked")
-        RingBuffer(int bufferSize, MultiProducerSequencer sequencer) {
+        RingBuffer(int bufferSize, MultiProducerSequencer sequencer, int availableCapacity) {
             this.sequencer = sequencer;
             this.entries = new Entry[bufferSize];
             for (int i = 0; i < bufferSize; i++) entries[i] = new Entry<>();
+            // capacity 至少 = 序号上限（这里用 main 传入的最大序号数）
+            this.available = new AvailableBuffer(availableCapacity);
         }
 
         public void publish(T value) {
@@ -37,6 +85,7 @@ public class MiniMultiProducerDemo {
             Entry<T> e = entries[(int) (seq & sequencer.mask())];
             e.value = value;
             e.sequence = seq;                                       // 标记这个槽已发布
+            available.set(seq);                                     // 关键：在 availableBuffer 里打点
             sequencer.publish(seq);                                 // 推 cursor
         }
     }
@@ -64,6 +113,11 @@ public class MiniMultiProducerDemo {
         private final Sequence cursor;
         private volatile boolean running = true;
 
+        // === 诊断用 ===
+        private long mismatchHitCount;
+        private long mismatchSampleNext;
+        private long mismatchSamplePublished;
+
         BatchEventProcessor(RingBuffer<T> rb, MultiProducerSequencer seq,
                             Sequence cursor, EventHandler<T> handler) {
             this.rb = rb;
@@ -78,16 +132,23 @@ public class MiniMultiProducerDemo {
             while (running) {
                 long available = seq.cursor();                       // volatile 读 cursor
                 while (next <= available) {
-                    Entry<T> e = rb.entries[(int) (next & seq.mask())];
-                    long published = e.sequence;                    // 关键：读槽的发布标记
-                    if (published != next) {
-                        // 还没发布到这一条，等一下（避免 busy-spin）
+                    // 关键：用 availableBuffer 查 next 是否真的已发布，
+                    //       而不是读 Entry.sequence（Entry 会被复用覆盖！）
+                    if (!rb.available.isAvailable(next)) {
+                        // 这一条还没发布完，等一下
+                        mismatchHitCount++;
+                        mismatchSampleNext = next;
+                        if (mismatchHitCount == 1 || mismatchHitCount % 1000 == 0) {
+                            System.err.printf("[consumer] not-yet-available #%d: next=%d (slot idx=%d)%n",
+                                    mismatchHitCount, next, (int) (next & seq.mask()));
+                        }
                         LockSupport.parkNanos(1L);
-                        // 重新读 cursor，可能又推进了
                         available = seq.cursor();
                         continue;
                     }
+                    Entry<T> e = rb.entries[(int) (next & seq.mask())];
                     handler.onEvent(e.value, next, next == available);
+                    rb.available.clear(next);    // 处理完清掉 bit，让这个槽能"轮回"
                     cursor.set(next);
                     next++;
                 }
@@ -99,25 +160,32 @@ public class MiniMultiProducerDemo {
 
         public void stop() { running = false; }
         public long processed() { return cursor.get(); }
+        public long mismatchHitCount() { return mismatchHitCount; }
+        public long mismatchSampleNext() { return mismatchSampleNext; }
+        public long mismatchSamplePublished() { return mismatchSamplePublished; }
     }
 
     public static void main(String[] args) throws InterruptedException {
         final int bufferSize = 1024;
         final Sequence producerCursor = new Sequence(Sequence.INITIAL);
         final Sequence consumerCursor = new Sequence(Sequence.INITIAL);
+        final int producerCount = 3;
+        final long perProducer = 50_000_000L;
+        final long total = producerCount * perProducer;
+        final long timeoutNs = 10_000_000_000L; // 10 秒硬超时
+
         final MultiProducerSequencer sequencer =
                 new MultiProducerSequencer(bufferSize, producerCursor, consumerCursor);
-        final RingBuffer<Long> ring = new RingBuffer<>(bufferSize, sequencer);
-
-        final int producerCount = 3;
-        final long perProducer = 5_000_000L;
-        final long total = producerCount * perProducer;
+        final RingBuffer<Long> ring = new RingBuffer<>(bufferSize, sequencer, (int) total);
 
         BatchEventProcessor<Long> consumer = new BatchEventProcessor<>(
                 ring, sequencer, consumerCursor,
                 (event, sequence, endOfBatch) -> {
                     if (event == null) {
                         throw new IllegalStateException("消费到 null @ " + sequence);
+                    }
+                    if ((sequence & 0x3FFF) == 0) {
+                        System.out.printf("[consumer] processed %d%n", sequence);
                     }
                 });
 
@@ -139,7 +207,36 @@ public class MiniMultiProducerDemo {
         }
         for (Thread t : producers) t.join();
 
+        long deadline = start + timeoutNs;
+        long lastProcessed = -1;
+        long stalledReports = 0;
         while (consumer.processed() < total - 1) {
+            long p = consumer.processed();
+            if (p != lastProcessed) {
+                lastProcessed = p;
+                stalledReports = 0;
+            } else {
+                stalledReports++;
+                if (stalledReports == 1 || stalledReports % 50 == 0) {
+                    System.err.printf("[main] consumer stalled at processed=%d for ~%d ms; "
+                                    + "mismatchHits=%d, last mismatch next=%d published=%d%n",
+                            p, (stalledReports * 1_000L) / 1_000_000L * 1_000_000L,
+                            consumer.mismatchHitCount(),
+                            consumer.mismatchSampleNext(),
+                            consumer.mismatchSamplePublished());
+                }
+            }
+            if (System.nanoTime() > deadline) {
+                System.err.printf("[main] TIMEOUT after 10s. consumer.processed=%d, total-1=%d, notYetAvailable=%d%n",
+                        consumer.processed(), total - 1, consumer.mismatchHitCount());
+                consumer.stop();
+                consumerThread.join(2000);
+                // 打印消费者卡住的那条 next 状态
+                long stuckNext = consumer.processed() + 1;
+                System.err.printf("[main] consumer is stuck at next=%d, availableBuffer.isAvailable=%b%n",
+                        stuckNext, ring.available.isAvailable(stuckNext));
+                return;
+            }
             LockSupport.parkNanos(1_000L);
         }
         long elapsedNs = System.nanoTime() - start;

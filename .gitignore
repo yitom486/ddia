@@ -34,3 +34,6 @@ outbox-demo/*.log
 
 # ===== Cursor Agent 内部目录 =====
 .agents/
+
+# ===== Metals (Scala 客户端) 缓存 =====
+.metals/
