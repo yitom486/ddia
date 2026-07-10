@@ -1,6 +1,7 @@
 package io.ddia.disruptor.lab.multiproducer;
 
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * 多生产者序号分配器：Disruptor 多生产者模式的核心，简化自 LMAX 源码。
@@ -59,35 +60,33 @@ public class MultiProducerSequencer {
      * 与单生产者的对照：
      *   单：nextValue 是普通 long，nextValue++ 即可
      *   多：nextValue 是 AtomicLong，必须 compareAndSet；失败说明别人抢先了，重试
+     *
+     * 关键修复（对比错误版本）：
+     *   错误版本用 do-while + continue：continue 跳到 while 条件，current 不重新读，
+     *   spin 后 CAS 成功就直接退出，把本不该拿到的序号返回去了。
+     *   正确版本用 while(true) + continue：continue 跳回循环顶部，current 重新读，
+     *   spin 后 CAS 失败就重试，CAS 成功才退出——永远不会在绕环保护失效时拿到序号。
      */
     public long next() {
-        long current;
-        long next;
-        long wrapPoint;
-        long cached = cachedGating.get();
+        while (true) {
+            long current = nextValue.get();
+            long next = current + 1;
+            long wrapPoint = next - bufferSize;
 
-        do {
-            current = nextValue.get();                // volatile 读
-            next = current + 1;
-
-            wrapPoint = next - bufferSize;
-            if (wrapPoint > cached) {                  // 真的要绕环了
-                long min = minGating();                // volatile 读消费者进度
-                if (wrapPoint > min) {
-                    // 消费者没跟上，让出 CPU，但这里没 park，跟单生产者也不同：
-                    // 多生产者下 park 完醒来还得重新读 nextValue，因为别人可能改过了
-                    Thread.onSpinWait();
-                    continue;                          // 重新进 do-while 循环
+            if (wrapPoint > cachedGating.get()) {
+                long min = minGating();
+                cachedGating.set(min);
+                if (wrapPoint > cachedGating.get()) {
+                    LockSupport.parkNanos(1L);
+                    continue;
                 }
-                cachedGating.set(min);                 // 缓存回去，给别的线程用
-                cached = min;
             }
-            // CAS 抢 nextValue：expected=current, new=next
-            // 失败说明别的线程抢先 +1 了，current 已过期，重新读
-        } while (!nextValue.compareAndSet(current, next));
 
-        casAttemptCount++;
-        return next;
+            if (nextValue.compareAndSet(current, next)) {
+                casAttemptCount++;
+                return next;
+            }
+        }
     }
 
     /**

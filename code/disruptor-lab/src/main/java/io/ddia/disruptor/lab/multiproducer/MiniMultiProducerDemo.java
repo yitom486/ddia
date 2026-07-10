@@ -27,39 +27,45 @@ public class MiniMultiProducerDemo {
      *   仅靠 Entry.sequence 是不够的。因为 bufferSize=1024 远小于总消息数 15 万，
      *   同一个 Entry 会被生产者写多次，Entry.sequence 会被覆盖成最新的 seq。
      *   消费者想消费 seq=1 时，Entry[1].sequence 早已被覆盖成 1025、2049 ... 149505。
-     *   解决方案：用 availableBuffer 记录每个 seq 是否已发布，bit=1 表示已发布。
-     *   消费者查 bit 而不是读 Entry.sequence，避免被覆盖后的"假阳性"。
+     *   解决方案：用 availableBuffer 记录每个槽位是否已发布，bit=1 表示已发布。
+     *   用 seq & mask 作为索引（与 Entry[] 一致），消费者查 bit 而不是读 Entry.sequence。
+     *
+     *   例如：bufferSize=1024，则：
+     *     seq=1     映射到 bit[0]（槽 0）
+     *     seq=1025  映射到 bit[0]（槽 0 的第二轮）
+     *     seq=2049  映射到 bit[0]（槽 0 的第三轮）
+     *   —— 同一个槽的同一轮只能被 set 一次（publish），被 clear 一次（consume）。
      */
     static final class AvailableBuffer {
-        final int capacity;   // 能记录的序号上限
-        // 用 AtomicLongArray 保证 set/clear 对消费者是 happens-before 可见的
+        final int bufferSize;
+        final long mask;
         final AtomicLongArray bits;
-        AvailableBuffer(int capacity) {
-            this.capacity = capacity;
-            this.bits = new AtomicLongArray((capacity + 63) >>> 6);
+        AvailableBuffer(int bufferSize) {
+            this.bufferSize = bufferSize;
+            this.mask = bufferSize - 1L;
+            this.bits = new AtomicLongArray((bufferSize >>> 6) + 1); // +1 保证够用
         }
         void set(long seq) {
-            int idx = (int) (seq >>> 6);
-            long mask = 1L << (int) (seq & 63);
-            // get + CAS（不同线程可能并发 set 同一个 word）
+            int idx = (int) ((seq & mask) >>> 6);
+            long bit = 1L << (int) (seq & 63);
             while (true) {
                 long old = bits.get(idx);
-                long newV = old | mask;
+                long newV = old | bit;
                 if (old == newV) return;     // 已经 set 过
                 if (bits.compareAndSet(idx, old, newV)) return;
             }
         }
         boolean isAvailable(long seq) {
-            int idx = (int) (seq >>> 6);
-            long mask = 1L << (int) (seq & 63);
-            return (bits.get(idx) & mask) != 0;
+            int idx = (int) ((seq & mask) >>> 6);
+            long bit = 1L << (int) (seq & 63);
+            return (bits.get(idx) & bit) != 0;
         }
         void clear(long seq) {
-            int idx = (int) (seq >>> 6);
-            long mask = 1L << (int) (seq & 63);
+            int idx = (int) ((seq & mask) >>> 6);
+            long bit = 1L << (int) (seq & 63);
             while (true) {
                 long old = bits.get(idx);
-                long newV = old & ~mask;
+                long newV = old & ~bit;
                 if (old == newV) return;
                 if (bits.compareAndSet(idx, old, newV)) return;
             }
@@ -72,12 +78,11 @@ public class MiniMultiProducerDemo {
         final AvailableBuffer available;   // 新增：记录每个 seq 是否已发布
 
         @SuppressWarnings("unchecked")
-        RingBuffer(int bufferSize, MultiProducerSequencer sequencer, int availableCapacity) {
+        RingBuffer(int bufferSize, MultiProducerSequencer sequencer) {
             this.sequencer = sequencer;
             this.entries = new Entry[bufferSize];
             for (int i = 0; i < bufferSize; i++) entries[i] = new Entry<>();
-            // capacity 至少 = 序号上限（这里用 main 传入的最大序号数）
-            this.available = new AvailableBuffer(availableCapacity);
+            this.available = new AvailableBuffer(bufferSize);
         }
 
         public void publish(T value) {
@@ -119,7 +124,7 @@ public class MiniMultiProducerDemo {
         private long mismatchSamplePublished;
 
         BatchEventProcessor(RingBuffer<T> rb, MultiProducerSequencer seq,
-                            Sequence cursor, EventHandler<T> handler) {
+                           Sequence cursor, EventHandler<T> handler) {
             this.rb = rb;
             this.seq = seq;
             this.cursor = cursor;
@@ -176,7 +181,7 @@ public class MiniMultiProducerDemo {
 
         final MultiProducerSequencer sequencer =
                 new MultiProducerSequencer(bufferSize, producerCursor, consumerCursor);
-        final RingBuffer<Long> ring = new RingBuffer<>(bufferSize, sequencer, (int) total);
+        final RingBuffer<Long> ring = new RingBuffer<>(bufferSize, sequencer);
 
         BatchEventProcessor<Long> consumer = new BatchEventProcessor<>(
                 ring, sequencer, consumerCursor,
@@ -220,7 +225,7 @@ public class MiniMultiProducerDemo {
                 if (stalledReports == 1 || stalledReports % 50 == 0) {
                     System.err.printf("[main] consumer stalled at processed=%d for ~%d ms; "
                                     + "mismatchHits=%d, last mismatch next=%d published=%d%n",
-                            p, (stalledReports * 1_000L) / 1_000_000L * 1_000_000L,
+                            p, (stalledReports * 1_000_000L) / 1_000_000L,
                             consumer.mismatchHitCount(),
                             consumer.mismatchSampleNext(),
                             consumer.mismatchSamplePublished());
@@ -237,7 +242,7 @@ public class MiniMultiProducerDemo {
                         stuckNext, ring.available.isAvailable(stuckNext));
                 return;
             }
-            LockSupport.parkNanos(1_000L);
+            LockSupport.parkNanos(1_000_000L);
         }
         long elapsedNs = System.nanoTime() - start;
         consumer.stop();
