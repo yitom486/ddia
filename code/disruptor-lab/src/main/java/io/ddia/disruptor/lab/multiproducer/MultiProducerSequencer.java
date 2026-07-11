@@ -13,13 +13,11 @@ import java.util.concurrent.locks.LockSupport;
  *
  * 关键点：
  *   nextValue         : AtomicLong.compareAndSet 抢序号（每条消息可能多次 CAS）
- *   cachedGating      : 仍然只是普通 long，但只在"单写者窗口"里写
- *   cursor            : AtomicLong，最后一步发布用 set()（单写者窗口结束）
+ *   cachedGating      : AtomicLong，缓存 gating 最小值，减少 volatile 读
+ *   cursor            : Sequence，publish 时 CAS 取 max，保证扫描上界单调不回退
  *
- * "单写者窗口"是 LMAX 多生产者 Sequencer 的精髓：
- *   一次 next() 调用里，cachedGating 是本地变量，不会有别的线程碰它。
- *   出了 next() 之后才把它"提交"回去（用 putOrderedInt 到一个 padded int[]，
- *   或用 AtomicLongFieldUpdater 等价方案）。这里为了简洁，直接用 AtomicLong。
+ * 多生产者下申请顺序可以乱于发布顺序；cursor 只表示"消费者最多该扫到哪里"，
+ * 具体序号是否已发布由 AvailableBuffer 判断。
  */
 public class MultiProducerSequencer {
 
@@ -36,9 +34,9 @@ public class MultiProducerSequencer {
     // 但线程 B 正在算自己的 wrapPoint、可能要等 —— 所以这个值也得线程安全
     private final AtomicLong cachedGating = new AtomicLong(Sequence.INITIAL);
 
-    // ===== 可视化计数器 =====
-    public long casAttemptCount;   // next() 里 CAS 失败重试次数
-    public long volatileWriteCount;
+    // ===== 可视化计数器（多线程自增，必须原子） =====
+    public final AtomicLong casAttemptCount = new AtomicLong();
+    public final AtomicLong volatileWriteCount = new AtomicLong();
 
     public MultiProducerSequencer(int bufferSize, Sequence cursor, Sequence... gatingSequences) {
         if (Integer.bitCount(bufferSize) != 1) {
@@ -83,24 +81,31 @@ public class MultiProducerSequencer {
             }
 
             if (nextValue.compareAndSet(current, next)) {
-                casAttemptCount++;
+                casAttemptCount.incrementAndGet();
                 return next;
             }
         }
     }
 
     /**
-     * 发布。与单生产者最大的不同：这里 cursor.set() 之前，
-     * 调用方必须先把 Entry 自己的 sequence 标记写好。
+     * 发布：把 cursor 单调推进到至少 sequence。
      *
-     * 为什么不能用 cachedValue/单写者窗口？
-     *   单生产者：cursor 的"新值"和"旧值"是同一个线程算的，能用 set()
-     *   多生产者：cursor.set() 也仍然是 volatile 写（不是 CAS），因为发布时刻
-     *            只受"我自己的 next()"结果影响，set 仍然是原子的"覆盖"语义。
+     * 多生产者申请顺序 ≠ 发布顺序。若直接 cursor.set(sequence)，后发布的小序号
+     * 会把 cursor 从较大值写回较小值（倒退），消费者以 cursor 为扫描上界时会永久漏掉
+     * 已经 available 的后续序号。因此这里必须 CAS 取 max，禁止回退。
+     *
+     * 调用方须先写好 Entry / availableBuffer，再调本方法。
      */
     public void publish(long sequence) {
-        cursor.set(sequence);                          // 一次 volatile 写（不是 CAS）
-        volatileWriteCount++;
+        volatileWriteCount.incrementAndGet(); // 每次 publish 调用计一次（含未抬高 cursor 的小序号）
+        long cur;
+        do {
+            cur = cursor.get();
+            if (sequence <= cur) {
+                return; // 后发布的小序号：上界已够大，不回写
+            }
+            casAttemptCount.incrementAndGet();
+        } while (!cursor.compareAndSet(cur, sequence));
     }
 
     public long cursor() { return cursor.get(); }

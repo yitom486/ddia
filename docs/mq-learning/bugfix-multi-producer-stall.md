@@ -3,7 +3,19 @@
 > 配套代码：[`code/disruptor-lab/src/main/java/io/ddia/disruptor/lab/multiproducer/MiniMultiProducerDemo.java`](../../code/disruptor-lab/src/main/java/io/ddia/disruptor/lab/multiproducer/MiniMultiProducerDemo.java)
 > 配套主文档：[`docs/mq-learning/Disruptor详解.md`](Disruptor详解.md)
 >
-> 诊断状态：已经定位两阶段缺陷。第一阶段是 `next()` 的绕环保护失效，导致未消费槽位被覆盖；第二阶段是修正绕环保护后，多生产者仍通过 `cursor.set(sequence)` 乱序更新发布上界，使 cursor 倒退。后者会让消费者看不到已经发布的后续序号，并可能进一步形成消费者、生产者和主线程之间的永久等待。完整修复必须同时保证容量保护正确、发布状态可见、cursor 上界单调不回退。
+> 诊断状态：**已修复并验证**。缺陷分两阶段：① `next()` 的 `do-while + continue` 绕环保护失效，未消费槽被覆盖；② 修正后 `publish` 仍用 `cursor.set(sequence)` 导致上界倒退，消费者漏扫已 available 的序号，环满后形成逻辑死锁。完整修复同时保证：容量保护正确、`availableBuffer` 发布可见、cursor 经 CAS 取 max 单调不回退。验证见第 14 节。
+
+---
+
+## 怎么读这份文档
+
+| 目的 | 跳到 |
+|---|---|
+| 只想看结论与检查清单 | [第 12 节](#12-诊断与防御清单) |
+| 想看可迁移的并发判定纲领 | [第 13 节](#13-并发问题的判定纲领) |
+| 想看修复是否真的闭环 | [第 14 节](#14-修复闭环与验证) |
+| 想跟完整排查过程 | 从第 1 节顺序读到第 11 节 |
+| 想先搞懂「单调」「位图」为什么必须 | [第 2.5 节](#25-核心概念槽复用发布位图与-cursor-单调) |
 
 ---
 
@@ -11,6 +23,7 @@
 
 1. [现象描述](#1-现象描述)
 2. [不是"残留进程"：是真正的算法缺陷](#2-不是残留进程是真正的算法缺陷)
+2.5. [核心概念：槽复用、发布位图与 cursor 单调](#25-核心概念槽复用发布位图与-cursor-单调)
 3. [根因分析：绕环保护失效导致 Entry.sequence 被覆盖](#3-根因分析绕环保护失效导致-entrysequence-被覆盖)
 4. [验证：用日志复现问题](#4-验证用日志复现问题)
 5. [第一次修复尝试：引入 availableBuffer 位图](#5-第一次修复尝试引入-availablebuffer-位图)
@@ -22,6 +35,7 @@
 11. [为什么这个 bug 如此隐蔽](#11-为什么这个-bug-如此隐蔽)
 12. [诊断与防御清单](#12-诊断与防御清单)
 13. [并发问题的判定纲领](#13-并发问题的判定纲领)
+14. [修复闭环与验证](#14-修复闭环与验证)
 
 ---
 
@@ -56,13 +70,168 @@ mvn -q -f code/disruptor-lab/pom.xml exec:java \
 
 ---
 
+## 2.5 核心概念：槽复用、发布位图与 cursor 单调
+
+后面几节的 bug 都绕不开三个概念。如果这里没想清楚，很容易把「症状」（卡住、错读）和「机制」（复用、单调、独立标记）混在一起。本节只讲**为什么必须这样设计**，具体哪行代码写错了见第 3、5、10 节。
+
+### 2.5.1 环形队列在复用什么？
+
+RingBuffer 的长度固定（本 demo `bufferSize=1024`），但消息序号从 `0, 1, 2, …` **无限递增**。槽位下标只靠取模：
+
+```text
+slotIndex = sequence & (bufferSize - 1)
+
+seq=1     → Entry[1]
+seq=1025  → Entry[1]    （同一物理槽，第 2 圈）
+seq=2049  → Entry[1]    （第 3 圈）
+```
+
+```mermaid
+flowchart LR
+  subgraph ring["RingBuffer 只有 1024 个槽"]
+    E1["Entry[1]"]
+  end
+
+  S1["seq=1\n第 1 圈写入"] --> E1
+  S2["seq=1025\n第 2 圈覆盖"] --> E1
+  S3["seq=2049\n第 3 圈再覆盖"] --> E1
+
+  style E1 fill:#fff3cd
+```
+
+**可以复用槽，但不能复用「还没被消费者处理完」的那一轮。** 容量保护（`next()` 里的 gating）管的就是这件事：生产者绕环前必须等消费者 cursor 推进，否则会把旧数据直接盖掉。
+
+### 2.5.2 为什么复用槽时不能靠 Entry 判断「是否已发布」？
+
+`Entry` 里同时存两样东西：
+
+| 字段 | 语义 |
+|---|---|
+| `value` | 消息载荷 |
+| `sequence` | 写入时记录的序号（也可当发布标记） |
+
+槽被复用后，**后一圈写入会把 `Entry.sequence` 盖成更大的序号**。消费者若还在等 `seq=1`，去读 `Entry[1].sequence`，看到的可能是 `149505`——不是「1 还没发布」，而是「这个槽早被第 N 圈占用了」。
+
+```mermaid
+flowchart TB
+  subgraph reuse["Entry[1] 被反复复用"]
+    T1["T1: 生产者写 seq=1\nEntry[1].sequence = 1"]
+    T2["T2: 消费者还没读到 1"]
+    T3["T3: 生产者又写 seq=1025\nEntry[1].sequence = 1025 ← 覆盖"]
+    T4["T4: 消费者终于来读 next=1\n读到 sequence=1025 ≠ 1\n永远 mismatch"]
+    T1 --> T2 --> T3 --> T4
+  end
+```
+
+所以需要**第二套存储**：发布状态不能和会被复用的 `Entry` 绑死。这就是 `availableBuffer` / 位图存在的原因——它回答的是：
+
+> **「序号 N 这一条，有没有发布完成？」**  
+> 而不是「**这个槽里最后一次写的是几号？**」
+
+```mermaid
+flowchart LR
+  P["生产者 publish(seq=N)"]
+  E["Entry[slot]\n载荷，会被覆盖"]
+  AV["availableBuffer\n发布状态，独立于槽内容"]
+  C["消费者"]
+
+  P -->|"写 value"| E
+  P -->|"set(N)"| AV
+  C -->|"读载荷"| E
+  C -->|"isAvailable(N)?"| AV
+
+  style AV fill:#d4edda
+  style E fill:#fff3cd
+```
+
+**位图不是 LMAX 的唯一做法**（第 7 节：生产实现用 `int[]` 存轮次 flag）。本 demo 用单 bit 是教学简化；共同点是：**发布元数据和会被复用的数据槽分离。**
+
+### 2.5.3 「单调」是什么意思？cursor 为什么必须单调？
+
+这里说的**单调**（monotonic）指一个跨线程共享的数值**只增不减**：
+
+```text
+cursor 的历史:  -1 → 0 → 1 → 5 → 5 → 8 → …
+                ✓ 可以相等（后发布的小序号被忽略）
+                ✓ 可以跳增（中间有洞）
+                ✗ 不能 8 → 3（倒退）
+```
+
+本 demo 里 `cursor` 的职责不是「`[0..cursor]` 全都已发布」（多生产者会有洞），而是给消费者一个**扫描上界**：
+
+```java
+long upper = seq.cursor();
+while (next <= upper) {
+    if (!available.isAvailable(next)) { /* 这一条还没发完，等 */ }
+    else { /* 消费 next */ }
+}
+```
+
+这段代码隐含一条契约：
+
+| 条件 | 消费者的解读 |
+|---|---|
+| `next > upper` | 后面**暂时**没有值得检查的序号，先 park |
+| `next <= upper` | 至少应该**进去查** `isAvailable(next)` |
+
+**只有 `upper` 单调不回退，「next > upper ⇒ 不用查」才成立。** 若 `upper` 从 1 被写回 0：
+
+```mermaid
+sequenceDiagram
+  participant A as 生产者 A (seq=0, 慢)
+  participant B as 生产者 B (seq=1, 快)
+  participant Cur as cursor (扫描上界)
+  participant Con as 消费者
+
+  B->>Cur: publish(1)  cursor = 1
+  Note over Con: 可扫描 next=0,1
+  A->>Cur: publish(0)  cursor = 0 ⚠ 倒退
+  Con->>Con: 消费完 seq=0, next=1
+  Con->>Cur: 读 upper=0
+  Note over Con: 1 > 0, 不进内层循环
+  Note over Con: isAvailable(1)=true 但永远查不到
+```
+
+这就是第 10 节卡死的根因：**不是 bit 没写上，而是倒退的 cursor 把已发布的序号挡在扫描范围外。**
+
+`volatile` 保证这次写入**最终能被看到**，**不**保证多个线程写入后取 `max`——`set` 是覆盖，不是「原子地取更大值再写」。多生产者下必须用 CAS 实现 `cursor = max(cursor, sequence)`，或干脆让 publish 不碰 cursor（见第 7、14 节）。
+
+### 2.5.4 三个概念如何一起工作
+
+把三者叠在一起，正确的不变量是：
+
+```mermaid
+flowchart TB
+  subgraph inv1["① 容量不变量（next + gating）"]
+    N["生产者申请 seq 前\n不能覆盖未消费槽"]
+  end
+  subgraph inv2["② 发布不变量（availableBuffer）"]
+    A["每个 seq 有独立发布标记\n不随 Entry 复用而丢失"]
+  end
+  subgraph inv3["③ 上界不变量（cursor 单调）"]
+    C["cursor 只作扫描上界\n只增不减"]
+  end
+
+  N -->|"保证 slot 里 value 仍属当前 seq"| E["Entry[slot]"]
+  A -->|"保证能判断 seq 是否已发布"| Con["消费者按 next 顺序消费"]
+  C -->|"保证不会漏扫已发布的 seq"| Con
+
+  inv1 -.->|"缺了 → 错读 value"| X1["event ≠ sequence"]
+  inv2 -.->|"缺了 → 永久 mismatch"| X2["等 Entry.sequence 永远等不到"]
+  inv3 -.->|"缺了 → 漏扫 available"| X3["isAvailable=true 却不处理"]
+```
+
+本 bug 的三层误判，正好对应三层不变量逐个失守又被「修症状」掩盖的过程（第 9.4、11.2 节）。
+
+---
+
 ## 3. 根因分析：绕环保护失效导致 Entry.sequence 被覆盖
 
 先把层次分清：
 
 - **直接现象**：消费者等 `next=1`，但同一个槽里的 `Entry.sequence` 已经变成 `149505`，所以永远等不到 `1`
 - **真正原因**：生产者本不该在消费者没跟上时继续绕环写同一个槽，但 `MultiProducerSequencer.next()` 里的容量保护写错了，导致生产者仍然 CAS 成功并继续申请新序号
-- **设计问题**：简化 demo 又把 `Entry.sequence` 同时当作“槽里是哪条消息”和“这条 seq 是否已发布”的标记，一旦槽被复用覆盖，消费者就没有独立的发布状态可查
+- **设计问题**：简化 demo 又把 `Entry.sequence` 同时当作“槽里是哪条消息”和“这条 seq 是否已发布”的标记，一旦槽被复用覆盖，消费者就没有独立的发布状态可查（机制原因见 [2.5.2](#252-为什么复用槽时不能靠-entry-判断是否已发布)）
 
 ### 3.1 简化版多生产者的发布-消费约定
 
@@ -152,6 +321,8 @@ if (wrapPoint > cached) {
 
 ### 3.5 另一个语义问题：cursor 不能简单 `set(sequence)`
 
+> 关于「单调」的定义、消费者为何依赖单调上界、以及 `volatile` 与单调的区别，见 [2.5.3](#253-单调是什么意思cursor-为什么必须单调)。
+
 当前 `publish(sequence)` 还是：
 
 ```java
@@ -236,6 +407,8 @@ public void publish(long sequence) {
 ---
 
 ## 5. 第一次修复尝试：引入 availableBuffer 位图
+
+> 槽复用后为什么必须把发布状态从 `Entry` 拆出来、位图解决的是什么问题，见 [2.5.2](#252-为什么复用槽时不能靠-entry-判断是否已发布)。
 
 当时的第一版修复思路是：参考 LMAX 真实实现，给每个 seq 配一个独立的"是否已发布"标记位，**这个标记位不会被 `Entry` 槽位复用覆盖**。
 
@@ -376,16 +549,35 @@ B 写回 0b0100
 
 ## 7. LMAX 原版思路对照
 
-真实的 LMAX Disruptor 里，多生产者发布追踪也是用位图，叫 `availableBuffer`：
+真实的 LMAX Disruptor 里，多生产者发布追踪也叫 `availableBuffer`，但**不是位图**：
 
-- `next()` / `tryNext()` 负责申请序号，并且必须用消费者 gating sequence 防止生产者绕环覆盖未消费槽
-- `publish(seq)` 把这个 seq 标记为 available
-- 消费者等待某个 `next` 时，会结合 cursor 上界和 `availableBuffer` 判断从 `next` 开始最多连续可用到哪里
-- 消费者不靠 `Entry.sequence` 判断发布状态
+- 结构是 `int[]`，长度等于 ring buffer 容量
+- 每个槽存的是**轮次 flag**：`flag = (int) (sequence >>> indexShift)`（`indexShift = log2(bufferSize)`）
+- `publish(seq)` 把 `availableBuffer[seq & mask] = flag`
+- `isAvailable(seq)` 判断该槽当前 flag 是否等于 `seq` 对应的轮次
 
-`Entry.sequence`（在真实 LMAX 里叫 `event.getSequence()`）通常是 `entry` 写入时记录的 seq，消费者用它来**识别"我拿到的是哪条消息"**，而不是**判断是否已发布**。
+因此 `seq=1` 与 `seq=1025`（`bufferSize=1024`）落在同一槽，但 flag 不同（第 0 圈 vs 第 1 圈），**天生区分第几圈，不依赖 clear**。
 
-我们这个简化 demo 把两个语义都压在了 `Entry.sequence` 上，所以才漏掉了「Entry 会被覆盖」这个坑。同时，`next()` 里的 `do-while + continue` 又让绕环保护失效，使覆盖真的发生在未消费槽位上。正确实现中 `Entry.sequence` 仍然可以有，但只能用来标识数据来源；发布状态应该交给 `availableBuffer`，容量保护仍然必须由 sequencer 正确执行。
+职责划分：
+
+- `next()` / `tryNext()` 申请序号，并用 gating sequence 防止绕环覆盖未消费槽
+- `publish(seq)` 只标记该 seq 已发布（写 flag），**不**用乱序的 `set(sequence)` 当连续上界
+- 消费者结合 claimed cursor 上界与 `availableBuffer`，从 `next` 起找连续可消费区间
+- `Entry.sequence` / `event.getSequence()` 用来**识别拿到的是哪条消息**，不是发布状态
+
+### 7.1 本 demo 单 bit 方案的隐式不变量
+
+本 lab 为简化用了 `AtomicLongArray` 位图：`seq=1` 与 `seq=1025` 映射到**同一 bit**。它能工作，完全依赖：
+
+```text
+容量保护（gating consumerCursor）
+  + 消费者先 clear(next)、再 cursor.set(next)
+  ⇒ 生产者写下一轮同槽时，上一轮 bit 一定已被清掉
+```
+
+若有人把 `clear` 挪到 `cursor.set` 之后，或破坏 gating，单 bit 会立刻错读。LMAX 的轮次 flag 没有这条隐式依赖。**不要把本 demo 的位图等同于生产级 LMAX 实现。**
+
+我们最初把“是否已发布”和“是哪条消息”都压在 `Entry.sequence` 上，又叠加 `do-while + continue` 让绕环保护失效，才把覆盖问题暴露成永久卡住。
 
 ---
 
@@ -547,15 +739,17 @@ while (true) {
 
 > 只有确认容量足够以后，才允许执行 CAS 抢号。
 
-目前工作区中的 `MultiProducerSequencer.next()` 已经按这个原则改成 `while (true)`，因此旧版“容量不足仍执行 CAS”的控制流错误已经被修正。但是这只解决了提前绕环覆盖，并没有修正 `publish(sequence)` 对 cursor 的乱序覆盖问题。修正第一层问题后，仍需继续处理下面第 10 节的 cursor 倒退问题。
+目前工作区中的 `MultiProducerSequencer.next()` 已经按这个原则改成 `while (true)`，因此旧版“容量不足仍执行 CAS”的控制流错误已经被修正。`publish(sequence)` 也已改为 CAS 取 max（见第 14 节）；第 10 节保留的是修复前的倒退分析，便于对照。
 
 ---
 
 ## 10. 当前修复后仍会卡住：cursor 倒退形成永久等待
 
-### 10.1 当前剩余错误是什么
+### 10.1 修复前的剩余错误是什么
 
-当前 `MultiProducerSequencer` 把两个不同概念分成了两个字段：
+（本节描述的是 CAS 取 max 落地**之前**的状态；当前代码已修复，见第 14 节。）
+
+当时 `MultiProducerSequencer` 把两个不同概念分成了两个字段：
 
 - `nextValue`：生产者通过 CAS 抢号，表示目前最大申请到的序号
 - `cursor`：每个生产者完成写入后，通过 `publish(sequence)` 写入的序号
@@ -590,6 +784,8 @@ T4 之后 cursor 从 1 倒退成了 0。写入本身没有丢失，`seq=1` 的 a
 
 ### 10.2 为什么 availableBuffer 已经是 true，消费者仍然不处理
 
+> cursor 单调性的图解推演见 [2.5.3](#253-单调是什么意思cursor-为什么必须单调)。
+
 当前消费者不是无条件查询 `availableBuffer`，而是先读取 cursor，并把它作为扫描上界：
 
 ```java
@@ -603,7 +799,7 @@ while (next <= available) {
 }
 ```
 
-这段逻辑隐含了一个关键不变量：
+这段逻辑隐含了一个关键不变量（即 [2.5.3](#253-单调是什么意思cursor-为什么必须单调) 的「上界不变量」）：
 
 > cursor 必须是一个不会倒退的上界；只有这样，cursor 小于 next 才能表示“后面还没有任何值得检查的序号”。
 
@@ -823,7 +1019,9 @@ public void publish(long sequence) {
 
 注意它**不改变发布顺序**：B 仍然可以先于 A 发布 `seq=1`，只是 A 后发布 `seq=0` 时发现 `0 <= 1`，直接返回，cursor 留在 1。乱序发布照常发生，但上界不再倒退——这正是 11.2 节"修原因不修症状"的体现：修的是"set 覆盖单调值"这个根因，而不是牺牲并发去消除乱序这个症状。
 
-这条最小修补路径的优点是改动只集中在 `publish()` 一处、不破坏现有 `nextValue + cursor` 双字段结构；缺点是每次 publish 多一次 CAS（相比路径二的"publish 完全不碰 cursor"多了开销）。不过这种最小修补仍需要通过乱序发布、绕环、慢消费者和结束边界测试证明其正确性。
+> **实现状态**：工作区已按上述 CAS 取 max 落地（见第 14 节）。下面保留示意代码便于对照诊断过程。
+
+这条最小修补路径的优点是改动只集中在 `publish()` 一处、不破坏现有 `nextValue + cursor` 双字段结构；缺点是每次 publish 多一次 CAS（相比“publish 完全不碰 cursor、只用 claimed cursor 作上界”多了开销）。乱序发布、绕环、慢消费者和结束边界测试见第 14 节。
 
 ---
 
@@ -1107,7 +1305,109 @@ processed 长时间不变
 - **纲领决定治哪里**：三元组里消除哪一项、按 C→B→A 什么优先级选路。选错了，技巧再多也南辕北辙——本项目三轮误判就是有技巧（加日志、加测试、加超时）没纲领，每轮都在治症状。
 - **技巧决定怎么治**：具体用 `ReentrantLock` 还是 CAS、`volatile` 还是 `AtomicLongArray`、怎么写不阻塞。纲领对了、没有技巧也落不了地。
 
-所以是"**纲领优先，技巧支撑**"。记一百种锁的用法，不如先记住"遇到非原子 × 顺序依赖 × 共享可变就要问消除哪一项"——因为这一句能让你在第一眼就警觉，而技巧只有在你已经意识到要处理时才用得上。这也是为什么这份诊断记录把第 11–13 节放在具体修复之后：技巧已经在 1–10 节给过了，但真正能迁移到其他项目的，是最后三节的思想层。
+所以是"**纲领优先，技巧支撑**"。记一百种锁的用法，不如先记住"遇到非原子 × 顺序依赖 × 共享可变就要问消除哪一项"——因为这一句能让你在第一眼就警觉，而技巧只有在你已经意识到要处理时才用得上。这也是为什么这份诊断记录把第 11–13 节放在具体修复之后：技巧已经在 1–10 节给过了，但真正能迁移到其他项目的，是最后几节的思想层。
+
+---
+
+## 14. 修复闭环与验证
+
+第 1–13 节是验尸与纲领；本节证明**治愈有效**。
+
+### 14.1 代码改动摘要
+
+| 改动 | 作用 |
+|---|---|
+| `Sequence.compareAndSet`（`AtomicLongFieldUpdater`） | cursor 可做原子读-改-写 |
+| `publish()`：CAS 取 max，`sequence <= cur` 直接返回 | 上界单调，乱序发布不倒退 |
+| `next()`：保持 `while(true)`，容量不足不 CAS | 禁止覆盖未消费槽 |
+| 消费者断言 `event == sequence` | 暴露错读，不再只查非空 |
+| main 超时覆盖 `producer.join()` | 生产者卡在 `next()` 时也能打出 TIMEOUT |
+| 计数器改为 `AtomicLong` | 避免并发自增丢更新误导吞吐解读 |
+
+落地后的 `publish`：
+
+```java
+public void publish(long sequence) {
+    volatileWriteCount.incrementAndGet();
+    long cur;
+    do {
+        cur = cursor.get();
+        if (sequence <= cur) {
+            return; // 后发布的小序号不回写
+        }
+        casAttemptCount.incrementAndGet();
+    } while (!cursor.compareAndSet(cur, sequence));
+}
+```
+
+### 14.2 确定性乱序复现（修复前会失败的用例）
+
+[`VerifyMultiProducerFix`](../../code/disruptor-lab/src/test/java/io/ddia/disruptor/lab/multiproducer/VerifyMultiProducerFix.java) 覆盖：
+
+1. **顺序发号**：`next/publish` 连续
+2. **乱序不倒退**：申请 0、1 → `publish(1)` → cursor=1 → `publish(0)` → cursor **仍为 1**
+3. **消费者连续推进**：同上乱序后，真实消费者能消费到 `processed >= 1`
+4. **并发 + `event==sequence`**：3 生产者 × 2000 条，全部通过
+
+运行：
+
+```bash
+mvn -q -f code/disruptor-lab/pom.xml test-compile exec:java \
+  -Dexec.classpathScope=test \
+  -Dexec.mainClass=io.ddia.disruptor.lab.multiproducer.VerifyMultiProducerFix
+```
+
+实测输出：
+
+```text
+=== MultiProducer 修复验证 ===
+
+Test 1: 顺序发放（不触发绕环）
+  OK: 16 次 next/publish，序号连续 [0..15]
+Test 2: 乱序发布不倒退 cursor
+  OK: publish(1)→cursor=1，再 publish(0)→cursor 仍为 1（不倒退）
+Test 3: 乱序发布后消费者连续推进
+  OK: 先发 1 再发 0 后，消费者连续消费到 processed=1
+Test 4: 并发生产 + event==sequence 校验
+  OK: 6000 条全部消费且 event==sequence
+
+ALL CHECKS PASSED
+```
+
+若把 `publish` 改回 `cursor.set(sequence)`，Test 2 会立刻报 cursor 倒退为 0；Test 3 会在 `isAvailable(1)==true` 却扫不到的状态下超时——这正是第 10 节的卡死特征。
+
+### 14.3 Demo 端到端（带数据正确性校验）
+
+```bash
+mvn -q -f code/disruptor-lab/pom.xml exec:java \
+  -Dexec.mainClass=io.ddia.disruptor.lab.multiproducer.MiniMultiProducerDemo
+```
+
+`perProducer=50_000`，3 生产者，共 150,000 条；生产者写入 `event=seq`，消费者断言相等。实测：
+
+```text
+===== 多生产者 Disruptor 运行结果 =====
+生产者线程数    : 3
+消息总数        : 150,000 条
+端到端耗时      : 55 ms
+吞吐量          : 2.69 M ops/s
+
+===== 对照单生产者 =====
+publish() 次数                  : 150,000
+CAS 尝试次数                 : 309,766  <-- 这里不为 0
+CAS / 消息                   : 2.07
+```
+
+要点：
+
+- **能跑完**且 **`event==sequence` 全程成立**，才算正确（第 8/9 节曾把“跑完”误当成正确）
+- `publish() 次数 == 150,000`：计数器已改为原子，不再因并发自增丢更新
+- `CAS / 消息 ≈ 2`：含 `next()` 抢号 CAS + `publish()` 推 cursor CAS，高于“每条至少 1 次抢号”的下限是预期行为
+
+### 14.4 修复后仍须记住的简化边界
+
+- 单 bit `availableBuffer` 仍依赖第 7.1 节的隐式不变量；生产代码应优先考虑 LMAX 式轮次 flag
+- 本修复走的是“保留 published cursor + CAS max”最小路径，不是唯一正确设计；也可用 claimed cursor 作扫描上界、publish 只写 available
 
 ---
 
@@ -1115,8 +1415,9 @@ processed 长时间不变
 
 | 文件 | 改动 |
 |---|---|
-| [`MiniMultiProducerDemo.java`](../../code/disruptor-lab/src/main/java/io/ddia/disruptor/lab/multiproducer/MiniMultiProducerDemo.java) | 1. 新增 `AvailableBuffer` 类<br>2. `RingBuffer` 持 `available`，构造时接收 capacity<br>3. `RingBuffer.publish()` 末尾 `available.set(seq)`<br>4. 消费者查 `available.isAvailable(next)` 而非 `Entry.sequence`<br>5. 消费者处理完 `available.clear(next)`<br>6. `main` 里加超时、日志输出 |
-| [`MultiProducerSequencer.java`](../../code/disruptor-lab/src/main/java/io/ddia/disruptor/lab/multiproducer/MultiProducerSequencer.java) | 当前工作区已把 `next()` 改成 `while (true)`，容量不足时会回到循环开头而不执行 CAS；但 `publish(sequence)` 仍直接 `cursor.set(sequence)`，因此还存在第 10 节分析的 cursor 倒退问题 |
-| [`VerifyMultiProducerFix.java`](../../code/disruptor-lab/src/test/java/io/ddia/disruptor/lab/multiproducer/VerifyMultiProducerFix.java) | 新增顺序发号验证；尚未覆盖乱序发布、真实消费者推进及逻辑死锁闭环 |
+| [`Sequence.java`](../../code/disruptor-lab/src/main/java/io/ddia/disruptor/lab/multiproducer/Sequence.java) | 新增 `compareAndSet`（`AtomicLongFieldUpdater`） |
+| [`MultiProducerSequencer.java`](../../code/disruptor-lab/src/main/java/io/ddia/disruptor/lab/multiproducer/MultiProducerSequencer.java) | `next()` 用 `while(true)`；`publish()` CAS 取 max；计数器改 `AtomicLong` |
+| [`MiniMultiProducerDemo.java`](../../code/disruptor-lab/src/main/java/io/ddia/disruptor/lab/multiproducer/MiniMultiProducerDemo.java) | `AvailableBuffer`；消费者查位图 + `event==sequence`；超时覆盖 join；单 bit 隐式不变量注释 |
+| [`VerifyMultiProducerFix.java`](../../code/disruptor-lab/src/test/java/io/ddia/disruptor/lab/multiproducer/VerifyMultiProducerFix.java) | 顺序发号 + 乱序不倒退 + 消费者推进 + 并发 `event==sequence` |
 
-> 当前状态不是“位图已经加上，所以问题全部解决”，而是容量保护、发布标记和消费扫描三个环节正在逐层修正。`next()` 的旧控制流错误已经修正；下一步必须保证 cursor 单调不回退，并用乱序发布测试验证消费者最终能够连续推进。
+> 当前状态：容量保护、发布标记、cursor 单调、数据校验与乱序测试均已闭环。后续若对照 LMAX，可把单 bit 换成轮次 flag，并评估“publish 不碰 cursor”的另一条职责划分。

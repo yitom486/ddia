@@ -23,18 +23,18 @@ public class MiniMultiProducerDemo {
     }
 
     /**
-     * 关键差异（解决 Entry 复用被覆盖的 bug）：
-     *   仅靠 Entry.sequence 是不够的。因为 bufferSize=1024 远小于总消息数 15 万，
-     *   同一个 Entry 会被生产者写多次，Entry.sequence 会被覆盖成最新的 seq。
-     *   消费者想消费 seq=1 时，Entry[1].sequence 早已被覆盖成 1025、2049 ... 149505。
-     *   解决方案：用 availableBuffer 记录每个槽位是否已发布，bit=1 表示已发布。
-     *   用 seq & mask 作为索引（与 Entry[] 一致），消费者查 bit 而不是读 Entry.sequence。
+     * 发布状态位图（教学简化版）。
      *
-     *   例如：bufferSize=1024，则：
-     *     seq=1     映射到 bit[0]（槽 0）
-     *     seq=1025  映射到 bit[0]（槽 0 的第二轮）
-     *     seq=2049  映射到 bit[0]（槽 0 的第三轮）
-     *   —— 同一个槽的同一轮只能被 set 一次（publish），被 clear 一次（consume）。
+     * 仅靠 Entry.sequence 不够：槽会被复用，旧序号会被覆盖。这里用独立 bit 标记
+     * "该槽当前这一轮是否已发布"，消费者查 bit 而不是读 Entry.sequence。
+     *
+     * 与 LMAX 的差异（重要）：
+     *   LMAX availableBuffer 是 int[]，每个槽存的是轮次 flag（sequence >>> indexShift），
+     *   isAvailable 判断 flag 是否匹配，天生区分第几圈，不依赖 clear。
+     *   本 demo 用单 bit：seq=1 与 seq=1025 映射到同一 bit。正确性依赖隐式不变量：
+     *     容量保护阻止生产者覆盖未消费槽 + 消费者先 clear(next) 再推进 cursor
+     *   ⇒ 生产者写下一轮同槽时，上一轮 bit 一定已被清掉。
+     *   若破坏 clear/cursor 顺序，单 bit 方案会立刻出错。
      */
     static final class AvailableBuffer {
         final int bufferSize;
@@ -175,9 +175,10 @@ public class MiniMultiProducerDemo {
         final Sequence producerCursor = new Sequence(Sequence.INITIAL);
         final Sequence consumerCursor = new Sequence(Sequence.INITIAL);
         final int producerCount = 3;
-        final long perProducer = 50_000_000L;
+        // 默认 5 万/线程：足够绕环多次，又便于验证修复；压测可改大
+        final long perProducer = 50_000L;
         final long total = producerCount * perProducer;
-        final long timeoutNs = 10_000_000_000L; // 10 秒硬超时
+        final long timeoutNs = 30_000_000_000L; // 覆盖 producer join + 消费收尾
 
         final MultiProducerSequencer sequencer =
                 new MultiProducerSequencer(bufferSize, producerCursor, consumerCursor);
@@ -186,8 +187,10 @@ public class MiniMultiProducerDemo {
         BatchEventProcessor<Long> consumer = new BatchEventProcessor<>(
                 ring, sequencer, consumerCursor,
                 (event, sequence, endOfBatch) -> {
-                    if (event == null) {
-                        throw new IllegalStateException("消费到 null @ " + sequence);
+                    // 必须校验 event==sequence：只查非空会掩盖绕环覆盖错读
+                    if (event == null || event.longValue() != sequence) {
+                        throw new AssertionError(
+                                "wrong event: sequence=" + sequence + ", event=" + event);
                     }
                     if ((sequence & 0x3FFF) == 0) {
                         System.out.printf("[consumer] processed %d%n", sequence);
@@ -200,19 +203,33 @@ public class MiniMultiProducerDemo {
 
         Thread[] producers = new Thread[producerCount];
         long start = System.nanoTime();
+        final long deadline = start + timeoutNs;
         for (int i = 0; i < producerCount; i++) {
-            final int idx = i;
             producers[i] = new Thread(() -> {
                 for (long j = 0; j < perProducer; j++) {
-                    ring.publish((long) (idx * perProducer + j));
+                    // 写入 seq 本身，便于消费者断言 event == sequence
+                    long seq = sequencer.next();
+                    Entry<Long> e = ring.entries[(int) (seq & sequencer.mask())];
+                    e.value = seq;
+                    e.sequence = seq;
+                    ring.available.set(seq);
+                    sequencer.publish(seq);
                 }
             }, "producer-" + i);
             producers[i].setDaemon(true);
             producers[i].start();
         }
-        for (Thread t : producers) t.join();
 
-        long deadline = start + timeoutNs;
+        // 超时必须覆盖 join：生产者卡在 next() 时主线程也会卡在 join
+        for (Thread t : producers) {
+            long remainingMs = Math.max(1L, (deadline - System.nanoTime()) / 1_000_000L);
+            t.join(remainingMs);
+            if (t.isAlive() || System.nanoTime() > deadline) {
+                dumpTimeout(consumer, ring, sequencer, total, "producer.join");
+                return;
+            }
+        }
+
         long lastProcessed = -1;
         long stalledReports = 0;
         while (consumer.processed() < total - 1) {
@@ -223,23 +240,14 @@ public class MiniMultiProducerDemo {
             } else {
                 stalledReports++;
                 if (stalledReports == 1 || stalledReports % 50 == 0) {
-                    System.err.printf("[main] consumer stalled at processed=%d for ~%d ms; "
-                                    + "mismatchHits=%d, last mismatch next=%d published=%d%n",
-                            p, (stalledReports * 1_000_000L) / 1_000_000L,
-                            consumer.mismatchHitCount(),
-                            consumer.mismatchSampleNext(),
-                            consumer.mismatchSamplePublished());
+                    System.err.printf("[main] consumer stalled at processed=%d; "
+                                    + "notYetAvailableHits=%d, sample next=%d%n",
+                            p, consumer.mismatchHitCount(), consumer.mismatchSampleNext());
                 }
             }
             if (System.nanoTime() > deadline) {
-                System.err.printf("[main] TIMEOUT after 10s. consumer.processed=%d, total-1=%d, notYetAvailable=%d%n",
-                        consumer.processed(), total - 1, consumer.mismatchHitCount());
-                consumer.stop();
+                dumpTimeout(consumer, ring, sequencer, total, "consumer.wait");
                 consumerThread.join(2000);
-                // 打印消费者卡住的那条 next 状态
-                long stuckNext = consumer.processed() + 1;
-                System.err.printf("[main] consumer is stuck at next=%d, availableBuffer.isAvailable=%b%n",
-                        stuckNext, ring.available.isAvailable(stuckNext));
                 return;
             }
             LockSupport.parkNanos(1_000_000L);
@@ -258,11 +266,24 @@ public class MiniMultiProducerDemo {
         System.out.printf("吞吐量          : %.2f M ops/s%n", throughputMps);
         System.out.println();
         System.out.println("===== 对照单生产者 =====");
-        System.out.printf("publish() 次数 (volatile 写) : %,d%n", sequencer.volatileWriteCount);
-        System.out.printf("CAS 尝试次数                 : %,d  <-- 这里不为 0%n", sequencer.casAttemptCount);
+        System.out.printf("publish() 次数                  : %,d%n", sequencer.volatileWriteCount.get());
+        System.out.printf("CAS 尝试次数                 : %,d  <-- 这里不为 0%n", sequencer.casAttemptCount.get());
         System.out.printf("CAS / 消息                   : %.2f%n",
-                (double) sequencer.casAttemptCount / sequencer.volatileWriteCount);
+                (double) sequencer.casAttemptCount.get() / sequencer.volatileWriteCount.get());
         System.out.println();
         System.out.println("结论：多生产者路径上 CAS != 0，这是单生产者比多生产者快一个数量级的根本原因。");
+    }
+
+    private static void dumpTimeout(BatchEventProcessor<Long> consumer,
+                                    RingBuffer<Long> ring,
+                                    MultiProducerSequencer sequencer,
+                                    long total,
+                                    String where) {
+        long stuckNext = consumer.processed() + 1;
+        System.err.printf("[main] TIMEOUT at %s. consumer.processed=%d, total-1=%d, "
+                        + "producerCursor=%d, next=%d isAvailable=%b%n",
+                where, consumer.processed(), total - 1, sequencer.cursor(),
+                stuckNext, ring.available.isAvailable(stuckNext));
+        consumer.stop();
     }
 }
