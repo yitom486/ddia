@@ -16,6 +16,9 @@
 | 想看修复是否真的闭环 | [第 14 节](#14-修复闭环与验证) |
 | 想跟完整排查过程 | 从第 1 节顺序读到第 11 节 |
 | 想先搞懂「单调」「位图」为什么必须 | [第 2.5 节](#25-核心概念槽复用发布位图与-cursor-单调) |
+| 想搞懂位图 vs 数组下标怎么映射 | [第 2.5.2b 节](#252b-位图--数组到底怎么存为什么不直接用下标) |
+| 想逐步看清「发→消→第二圈覆盖」 | [第 2.5.2c 节](#252c-逐步推演第一圈发布--消费--第二圈覆盖两套信号) |
+| 想系统了解位图思想与其它场景 | [位图 Bitmap 思想与实践](../concurrency-thinking/位图Bitmap思想与实践.md) |
 
 ---
 
@@ -145,6 +148,320 @@ flowchart LR
 ```
 
 **位图不是 LMAX 的唯一做法**（第 7 节：生产实现用 `int[]` 存轮次 flag）。本 demo 用单 bit 是教学简化；共同点是：**发布元数据和会被复用的数据槽分离。**
+
+### 2.5.2b 位图 / 数组到底怎么存？为什么不「直接用下标」？
+
+先把三种常见方案摆开，再回答「为什么不直接用数组下标」。
+
+#### 方案 A：按序号无限增长的数组（直觉上最直接，实际不可行）
+
+```text
+available[seq] = true   // seq = 0, 1, 2, … 一直涨
+```
+
+消息序号是**无限递增**的。若真按 `seq` 当下标：
+
+- 跑 1.5 亿条就要约 1.5 亿个格子
+- 内存爆炸，也无法预分配固定大小
+
+所以**不能**把「无限的 sequence」直接当数组下标。环形结构的本质就是：用有限物理槽表示无限逻辑序号。
+
+#### 方案 B：按槽位下标的 `boolean[]` / `byte[]`（能用，但偏胖）
+
+```text
+slot = seq & (bufferSize - 1)
+available[slot] = true / false
+```
+
+`bufferSize=1024` 时只要 1024 个格子，和 RingBuffer 一一对应。这已经解决了「无限 seq」问题——**下标是槽号，不是序号本身**。
+
+```mermaid
+flowchart LR
+  subgraph seqs["无限序号"]
+    S0["0"]
+    S1["1"]
+    S1024["1024"]
+    S1025["1025"]
+  end
+  subgraph slots["有限槽 0..1023"]
+    B0["available[0]"]
+    B1["available[1]"]
+  end
+  S0 --> B0
+  S1024 --> B0
+  S1 --> B1
+  S1025 --> B1
+```
+
+问题在于：每个槽只存 1 bit 信息（发没发），却占 1 个 `boolean`（JVM 里通常 1 byte）甚至更多。1024 槽 ≈ 1KB；若 buffer 到 2^20，就是 1MB 只为了存「是否发布」。**信息密度低。**
+
+另外，本 demo 的单 bit / 单 boolean 方案还有同一局限：`seq=1` 与 `seq=1025` 共用同一格，**分不出第几圈**，必须靠 clear + 容量保护（见 7.1）。
+
+#### 方案 C：位图（本 demo）——把 64 个槽的「是否发布」塞进一个 `long`
+
+核心想法：每个槽仍只需 1 bit，但不要每个槽一个数组元素，而是：
+
+```text
+一个 long = 64 bit = 64 个槽的发布状态
+AtomicLongArray 长度 ≈ bufferSize / 64
+```
+
+映射公式（本 demo）：
+
+```text
+slot   = seq & mask              // 落到哪个环槽
+word   = slot >>> 6              // 第几个 long（每 64 槽一个）
+bit    = 1L << (slot & 63)       // 这个 long 里的第几位
+```
+
+```mermaid
+flowchart TB
+  subgraph words["AtomicLongArray bits[]"]
+    W0["bits[0]\n64 个 bit → 槽 0..63"]
+    W1["bits[1]\n64 个 bit → 槽 64..127"]
+    W2["bits[2]\n..."]
+  end
+
+  SEQ["seq=70\nslot=70"] --> W1
+  BIT["bit = 1L << 6\n即第 6 位"]
+  SEQ --> BIT
+  BIT --> W1
+```
+
+`set(70)` 就是对 `bits[1]` 做 `old | (1L<<6)` 的 CAS；`isAvailable(70)` 就是读出来看那一位是否为 1。
+
+**为什么说位图是「很好」的方案（在「每槽只要 0/1」的前提下）：**
+
+| 维度 | `boolean[bufferSize]` | 位图 `AtomicLongArray` |
+|---|---|---|
+| 内存 | 约 1 byte/槽 | **1 bit/槽**（约 1/8） |
+| 缓存友好 | 散开在更多 cache line | 64 槽挤在一个 long，局部性更好 |
+| 并发 | 每槽独立写较简单 | 同一 long 内多 bit 要 CAS，但吞吐仍很高 |
+| 语义 | 仍是「槽是否已发布」 | 相同；仍需 clear / 或改用轮次 |
+
+所以「好」指的是：**在「发布状态只需布尔、且与槽一一对应」时，位图是空间与局部性都更优的打包方式**——不是说它比 LMAX 的 `int[]` 轮次方案更正确。
+
+#### 方案 D：LMAX 的 `int[]` 轮次数组（生产级更常见）
+
+```text
+availableBuffer[slot] = (int)(seq >>> indexShift)   // 存「第几圈」
+isAvailable(seq) ⇔ availableBuffer[slot] == 该 seq 的圈数
+```
+
+| | 位图（demo） | `int[]` 轮次（LMAX） |
+|---|---|---|
+| 每槽存什么 | 1 bit：发没发 | 一个 int：第几圈的 flag |
+| 能否区分圈数 | 否（1 与 1025 同 bit） | **能** |
+| 要不要 clear | **要**（消费后清 bit） | **不要**（下一圈写新 flag 自然覆盖） |
+| 内存 | 最省 | 每槽 4 byte，仍远小于 Entry |
+
+LMAX 选 `int[]` 不是因为「不会用位图」，而是因为**多付一点内存，换掉 clear 依赖和圈数歧义**——对正确性更稳。
+
+#### 一句话对照「为什么不直接用数组下标」
+
+```text
+「直接用下标」若指 available[seq]：
+  → seq 无限，数组无法无限长 ✗
+
+「直接用下标」若指 available[slot] 的 boolean[]：
+  → 能用，语义和位图一样 ✓
+  → 只是每个布尔占一整格，浪费空间与缓存 ✗（相对位图）
+
+「位图」：
+  → 下标仍然是「槽 / word」，不是无限 seq
+  → 只是把 64 个布尔压进一个 long
+
+「LMAX int[]」：
+  → 下标也是槽
+  → 格子里不存 0/1，而存轮次，避免圈数混淆
+```
+
+```mermaid
+flowchart TB
+  Q["要记录「seq 是否已发布」"]
+  Q --> A["按 seq 当下标？"]
+  A -->|"无限增长"| Bad["内存爆炸 ✗"]
+  Q --> B["按 slot 当下标"]
+  B --> B1["boolean[slot]\n能用，偏胖"]
+  B --> B2["位图：64 槽/long\n省内存，需 clear"]
+  B --> B3["int[slot]=轮次\nLMAX：不 clear，可区分圈"]
+```
+
+### 2.5.2c 逐步推演：第一圈发布 → 消费 → 第二圈覆盖（两套信号）
+
+很多人会把两件事混成一件：**位图管「发没发」；`consumerCursor` 管「消没消、能不能盖」。** 生产者第二圈能不能写，**不看位图**，看的是消费者进度。
+
+下面用极小环 `bufferSize=8`（一个 `long` 就够装 8 个 bit），从空环推到第二圈。
+
+#### 初始：全 0
+
+```text
+bits[0] 的低 8 位（槽 0..7）：  0 0 0 0 0 0 0 0
+                                 ↑槽7 … … … … … ↑槽0
+
+Entry[0..7]：空
+producerCursor = -1
+consumerCursor = -1
+```
+
+#### 步骤 1：生产者发布 seq=0（占用槽 0）
+
+```text
+slot = 0 & 7 = 0
+word = 0 >>> 6 = 0
+bit  = 1L << 0 = …0001
+```
+
+动作：
+
+1. `next()` 抢到 0  
+2. 写 `Entry[0].value`  
+3. `available.set(0)` → `bits[0] |= 0b0001`  
+4. `publish(0)` → `producerCursor = 0`
+
+```text
+bits[0]:  0 0 0 0 0 0 0 1     ← 只有槽 0 这一位变成 1，表示「seq=0 已发布」
+                             ↑槽0
+```
+
+#### 步骤 2：再发 seq=1、seq=2
+
+同理：
+
+```text
+set(1) → bits |= 0b0010
+set(2) → bits |= 0b0100
+
+bits[0]:  0 0 0 0 0 1 1 1
+                      ↑2↑1↑0
+```
+
+**注意**：位从 0 变 1，只表示「这一条已经 publish」，**还没被消费**。
+
+#### 步骤 3：消费者怎么知道「可以读 / 还没发 / 已经读过」？
+
+消费者不猜，它按固定协议扫：
+
+```text
+next = 0 起
+upper = producerCursor          // 扫描上界
+若 next > upper          → 后面暂时没东西，park
+若 next ≤ upper：
+  若 isAvailable(next)=false → 这个序号还没 publish（多生产者空洞），park
+  若 isAvailable(next)=true  → 可以读 Entry，处理完再 clear + 推进 consumerCursor
+```
+
+```mermaid
+flowchart TD
+  A["消费者想处理 next"] --> B{"next ≤ producerCursor ?"}
+  B -->|否| P1["park：上界还没到"]
+  B -->|是| C{"isAvailable(next) ?"}
+  C -->|否| P2["park：序号已申请但未发布\n（多生产者空洞）"]
+  C -->|是| D["读 Entry → onEvent"]
+  D --> E["clear(next)：位图该位清 0"]
+  E --> F["consumerCursor = next\n← 这才是告诉生产者：我消化到这了"]
+```
+
+假设 `producerCursor=2`，消费者处理 `next=0`：
+
+1. `0 ≤ 2`，进内层  
+2. `isAvailable(0)==true`（bit0=1）  
+3. 读 `Entry[0]`，处理  
+4. **`clear(0)`** → `bits[0] &= ~0b0001` → bit0 变回 0  
+5. **`consumerCursor.set(0)`** → 消费者进度变成 0  
+6. `next` 变成 1，继续
+
+```text
+消费完 seq=0 之后：
+
+bits[0]:  0 0 0 0 0 1 1 0     ← bit0 已 clear；bit1、bit2 仍是 1（还没消费）
+consumerCursor = 0            ← 生产者看这个判断「能不能绕环」
+```
+
+**消费者「已经消耗」的权威信号不是位图变 0，而是 `consumerCursor` 往前推。**  
+`clear` 只是给**同一槽下一圈**腾出「发布位」，避免 bit 永远为 1。
+
+#### 步骤 4：第二圈——生产者怎么知道能覆盖槽 0？
+
+想申请 `seq=8`（第二圈回到槽 0）：
+
+```text
+wrapPoint = next - bufferSize = 8 - 8 = 0
+```
+
+`next()` 里的判断：
+
+```text
+若 wrapPoint > consumerCursor  → 还不能申请，必须等
+若 wrapPoint ≤ consumerCursor  → 消费者已经消化到至少 wrapPoint，可以盖
+```
+
+| consumerCursor | wrapPoint=0 | 能否申请 seq=8？ |
+|---|---|---|
+| 仍是 -1 | 0 > -1 | **不能**，槽 0 上的 seq=0 可能还没消费 |
+| 已经是 0 | 0 > 0 为假 | **能**，说明至少 seq=0 已消费完 |
+
+```mermaid
+sequenceDiagram
+  participant P as 生产者
+  participant G as next() 容量保护
+  participant CC as consumerCursor
+  participant Bit as 位图
+  participant C as 消费者
+
+  Note over P,C: —— 第一圈 ——
+  P->>Bit: set(0)  bit0=1
+  P->>P: publish → producerCursor=0
+  C->>Bit: isAvailable(0)=true
+  C->>Bit: clear(0)  bit0=0
+  C->>CC: consumerCursor=0  ★ 允许覆盖的信号
+
+  Note over P,C: —— 第二圈想写 seq=8（仍是槽 0）——
+  P->>G: next() 想要 8，wrapPoint=0
+  G->>CC: 读 consumerCursor
+  alt consumerCursor < 0
+    G-->>P: 等待（不能盖）
+  else consumerCursor ≥ 0
+    G-->>P: 允许申请 8
+    P->>Bit: set(8)  同一 bit0 再置 1
+    Note over Bit: seq=8 与 seq=0 共用 bit0<br/>靠上一圈已 clear + 容量保护保证安全
+  end
+```
+
+所以：
+
+| 问题 | 谁回答 | 怎么回答 |
+|---|---|---|
+| 这条 seq **发完了吗**？ | **位图** `isAvailable` | bit=1 已发，=0 未发或已 clear |
+| 消费者 **消化到哪了**？ | **`consumerCursor`** | 消费者处理完后 `cursor.set(next)` |
+| 第二圈 **能不能盖这个槽**？ | **`next()` 看 consumerCursor** | `wrapPoint > consumerCursor` 就等 |
+| clear 干什么？ | 给下一圈腾发布位 | **不是**生产者等待的信号 |
+
+#### 步骤 5：bufferSize=1024 时「第一个 long 的 64 位」长什么样
+
+本 demo 第一个 `bits[0]` 管槽 **0..63**（不是整个 1024）：
+
+```text
+发布 seq=0  → bits[0] 第 0 位 = 1
+发布 seq=1  → bits[0] 第 1 位 = 1
+发布 seq=63 → bits[0] 第 63 位 = 1
+发布 seq=64 → bits[1] 第 0 位 = 1   ← 换到第二个 long
+...
+发布 seq=1024 → 又回到 bits[0] 第 0 位（第二圈，同一 bit）
+```
+
+「第一、二、三个槽」就是依次把同一个 long 里相邻的 bit 置 1；消费则依次 clear。  
+第二圈能否覆盖，仍然只看 **`consumerCursor` 有没有越过 wrapPoint**，不看那些 bit 是 0 还是 1。
+
+#### 记一句口诀
+
+```text
+位图：     「发了没有？」—— 消费者查，publish 时 set，消费后 clear
+进度：     「吃到哪里？」—— consumerCursor，消费成功后推进
+容量保护： 「能不能盖？」—— 生产者 next() 比较 wrapPoint 与 consumerCursor
+```
+
+三套机制缺一不可：只有位图没有进度 → 生产者不知道何时可覆盖；只有进度没有位图 → 多生产者空洞时消费者不知道哪条真发完了。
 
 ### 2.5.3 「单调」是什么意思？cursor 为什么必须单调？
 
