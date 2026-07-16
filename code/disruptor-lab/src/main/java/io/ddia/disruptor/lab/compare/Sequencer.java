@@ -14,7 +14,11 @@ package io.ddia.disruptor.lab.compare;
         /** 告知消费者：序号 sequence 已经发布。 */
         void publish(long sequence);
 
-        /** 当前已发布到的最大序号。消费者用来探测"有没有新东西"。 */
+        /**
+         * 消费者可扫描的序号上界。
+         * 单生产者下它是最大已发布序号；多生产者下它是最大已申请序号，
+         * 具体 sequence 是否发布还必须由 isAvailable(sequence) 判断。
+         */
         long cursor();
 
         /** RingBuffer 取模掩码 = bufferSize - 1。 */
@@ -23,10 +27,10 @@ package io.ddia.disruptor.lab.compare;
         /** RingBuffer 容量。 */
         default int bufferSize() { return (int) (mask() + 1L); }
 
-        /** publish() 被调用次数（= 写入 volatile 的次数）。 */
+        /** publish() 被调用次数（单生产者发布 cursor，多生产者发布 availability flag）。 */
         long volatileWriteCount();
 
-        /** CAS 尝试次数（= next() 里 CAS 调用的次数）。 */
+        /** CAS 尝试次数（多生产者 next() 中每次 compareAndSet 调用都计数）。 */
         long casAttemptCount();
 
         /**

@@ -1,6 +1,9 @@
 package io.ddia.disruptor.lab.compare;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -8,7 +11,7 @@ import java.util.concurrent.locks.LockSupport;
  *
  * 控制变量（两边完全相同）：
  *   - bufferSize      = 1024
- *   - 消息总数         = 40,000,000（单: 4000 万；多: 4 生产者 × 1000 万）
+ *   - 默认消息总数     = 40,000,000（单: 4000 万；多: 4 生产者 × 1000 万）
  *   - 消费者线程数     = 1
  *   - 消息体           = 装箱 Long
  *
@@ -37,7 +40,7 @@ public class SingleVsMultiProducerDemo {
         System.out.flush();
     }
 
-    /** 槽位。多生产者下 sequence 字段用来识别"是否已发布"，处理空洞。 */
+    /** 槽位。sequence 用于校验消费者读到的确实是当前环次的数据。 */
     static final class Entry<T> {
         volatile T value;
         volatile long sequence = Sequence.INITIAL;
@@ -61,7 +64,7 @@ public class SingleVsMultiProducerDemo {
             long seq = sequencer.next();
             Entry<T> e = entries[(int) (seq & sequencer.mask())];
             e.value = value;
-            e.sequence = seq;                  // 多生产者靠这个标记识别"已发布"
+            e.sequence = seq;
             sequencer.publish(seq);
         }
     }
@@ -74,9 +77,9 @@ public class SingleVsMultiProducerDemo {
      * 批量消费者。
      *
      * 单生产者：cursor 推到 N 意味着 [0..N] 全部已发布，所以靠 `seq.cursor()` 一次性扫完一批。
-     * 多生产者：cursor 推到 N 不保证 [0..N] 全部已发布（中间可能有空洞），
-     *          因此必须对每个 next 检查 entry[next & mask].sequence == next。
-     *          cursor 只用作"hint"减少重试次数。
+     * 多生产者：cursor 推到 N 只表示 [0..N] 已被申请，中间可能有尚未 publish 的空洞，
+     *          因此必须对每个 next 检查 isAvailable(next)。发布标记可用后，再用
+     *          Entry.sequence 校验没有读到错误环次的数据。
      */
     static final class BatchEventProcessor<T> implements Runnable {
         private final RingBuffer<T> rb;
@@ -84,8 +87,9 @@ public class SingleVsMultiProducerDemo {
         private final Sequence cursor;
         private final EventHandler<T> handler;
         private final String tag;
-        private final long stopAt;     // 多生产者用：next > stopAt 时退出
+        private final long stopAt;
         private volatile boolean running = true;
+        private volatile Throwable failure;
 
         BatchEventProcessor(RingBuffer<T> rb, Sequencer seq, Sequence cursor,
                             EventHandler<T> handler, String tag, long stopAt) {
@@ -104,12 +108,10 @@ public class SingleVsMultiProducerDemo {
             int spinInRow = 0;
             long startedNs = System.nanoTime();
             try {
-                while (running) {
+                while (running && next <= stopAt) {
                     long available = seq.cursor();
                     if (next > available) {
-                        // 提示：所有 < available 的都推完了，扫不到新东西
-                        if (rb.multiProducer && next > stopAt) break;
-                        LockSupport.parkNanos(1L);
+                        Thread.onSpinWait();
                         if (++spinInRow % 1_000_000 == 0) {
                             long stuck = System.nanoTime() - startedNs;
                             log(tag, "  消费者空闲中 next=%d available=%d 已等 %d ms",
@@ -118,15 +120,18 @@ public class SingleVsMultiProducerDemo {
                         continue;
                     }
                     spinInRow = 0;
-                    while (next <= available) {
-                        Entry<T> e = rb.entries[(int) (next & seq.mask())];
+                    while (next <= available && next <= stopAt) {
                         if (rb.multiProducer) {
-                            // 多生产者：必须等到 entry[next] 真正被 publish 完
+                            // cursor 是 claimed 上界；具体 next 必须等发布标记完成。
                             if (!seq.isAvailable(next)) {
-                                LockSupport.parkNanos(1L);
-                                available = seq.cursor();
-                                break;  // 重读 available
+                                Thread.onSpinWait();
+                                break;
                             }
+                        }
+                        Entry<T> e = rb.entries[(int) (next & seq.mask())];
+                        if (e.sequence != next) {
+                            throw new IllegalStateException(
+                                    "槽位环次错误: expected=" + next + ", actual=" + e.sequence);
                         }
                         handler.onEvent(e.value, next, next == available);
                         cursor.set(next);
@@ -136,20 +141,21 @@ public class SingleVsMultiProducerDemo {
                             lastLog = next;
                             log(tag, "  消费者进度: %,d / next=%,d", next, next);
                         }
-                        if (rb.multiProducer && next > stopAt) break;
                     }
                 }
                 log(tag, "  消费者退出循环 (running=%s, next=%,d, stopAt=%,d)", running, next, stopAt);
             } catch (Throwable t) {
+                failure = t;
+                running = false;
                 log(tag, "!! 消费者异常 next=%d processed=%d : %s",
                         next, cursor.get(), t);
                 t.printStackTrace(System.out);
-                throw t;
             }
         }
 
         public void stop() { running = false; }
         public long processed() { return cursor.get(); }
+        public Throwable failure() { return failure; }
     }
 
     /** 单次跑测试的结果。 */
@@ -205,79 +211,91 @@ public class SingleVsMultiProducerDemo {
                         throw new IllegalStateException("消费到 null @ " + sequence);
                     }
                 },
-                label, total);
+                label, total - 1);
 
         Thread consumerThread = new Thread(consumer, label + ".consumer");
         consumerThread.setDaemon(true);
         consumerThread.start();
 
-        long start = System.nanoTime();
-
-        if (producerCount == 1) {
-            // 单生产者：直接在当前线程发，避免额外线程开销
-            long lastLog = 0;
-            for (long j = 0; j < perProducer; j++) {
-                ring.publish(j);
-                // 主动让出 CPU，让消费者线程能跑：
-                // 否则单生产者版本会"饿死"消费者，导致 while(processed < total-1) 死循环。
-                if ((j & 0x3FFL) == 0L) {
-                    LockSupport.parkNanos(1_000L);
-                }
-                if (j - lastLog >= LOG_EVERY) {
-                    lastLog = j;
-                    log(label, "  生产者进度: %,d", j);
-                }
-            }
-            log(label, "  生产者 (主线程) 已写完 等待消费者追平");
-        } else {
-            Thread[] producers = new Thread[producerCount];
-            for (int i = 0; i < producerCount; i++) {
-                final int idx = i;
-                producers[i] = new Thread(() -> {
+        CountDownLatch producersDone = new CountDownLatch(producerCount);
+        AtomicReference<Throwable> producerFailure = new AtomicReference<>();
+        Thread[] producers = new Thread[producerCount];
+        for (int i = 0; i < producerCount; i++) {
+            final int idx = i;
+            producers[i] = new Thread(() -> {
+                try {
                     long base = (long) idx * perProducer;
-                    long lastLog2 = 0;
+                    long lastLog = 0;
                     for (long j = 0; j < perProducer; j++) {
                         ring.publish(base + j);
-                        if (j - lastLog2 >= LOG_EVERY) {
-                            lastLog2 = j;
+                        if (j - lastLog >= LOG_EVERY) {
+                            lastLog = j;
                             log(label, "  producer-%d 进度: %,d", idx, j);
                         }
                     }
-                }, label + ".producer-" + i);
-                producers[i].setDaemon(true);
-                producers[i].start();
-            }
-            for (Thread t : producers) t.join();
-            log(label, "  %d 个生产者线程已 join 等待消费者追平", producerCount);
+                } catch (Throwable t) {
+                    producerFailure.compareAndSet(null, t);
+                } finally {
+                    producersDone.countDown();
+                }
+            }, label + ".producer-" + i);
+            producers[i].setDaemon(true);
         }
 
-        // 等消费者追上：增加超时保护
-        long deadlineNs = System.nanoTime() + 60L * 1_000_000_000L;  // 60 秒硬超时
-        long pollStartNs = System.nanoTime();
+        long start = System.nanoTime();
+        for (Thread producer : producers) {
+            producer.start();
+        }
+
+        // 监控必须覆盖生产者运行阶段，不能先无限 join 再开始计时。
+        long timeoutSeconds = Long.getLong("disruptor.timeoutSeconds", 120L);
+        long deadlineNs = start + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         long lastProgress = -1;
-        long lastProgressNs = pollStartNs;
-        long waitStart = System.nanoTime();
-        while (consumer.processed() < total - 1) {
-            LockSupport.parkNanos(1_000L);
+        long lastProgressNs = start;
+        while (producersDone.getCount() > 0 || consumer.processed() < total - 1) {
+            Throwable producerError = producerFailure.get();
+            if (producerError != null) {
+                consumer.stop();
+                throw new IllegalStateException("生产者异常", producerError);
+            }
+            Throwable consumerError = consumer.failure();
+            if (consumerError != null) {
+                throw new IllegalStateException("消费者异常", consumerError);
+            }
+
             long now = System.nanoTime();
             if (now > deadlineNs) {
-                log(label, "!! 消费者 60 秒内未追平: processed=%,d / total=%,d",
-                        consumer.processed(), total);
-                throw new IllegalStateException("消费者卡死");
+                consumer.stop();
+                log(label, "!! %d 秒内未完成: producersLeft=%d, processed=%,d / total=%,d, cursor=%,d",
+                        timeoutSeconds, producersDone.getCount(), consumer.processed(), total,
+                        sequencer.cursor());
+                throw new IllegalStateException("生产/消费流程超时");
             }
+
             long p = consumer.processed();
             if (p != lastProgress) {
                 lastProgress = p;
                 lastProgressNs = now;
             } else if (now - lastProgressNs > 5_000_000_000L) {
-                log(label, "!! 消费者 5 秒无进度: processed=%,d / total=%,d",
-                        p, total);
+                consumer.stop();
+                log(label, "!! 5 秒无消费进度: producersLeft=%d, processed=%,d / total=%,d, cursor=%,d",
+                        producersDone.getCount(), p, total, sequencer.cursor());
                 throw new IllegalStateException("消费者停滞");
             }
+            LockSupport.parkNanos(1_000_000L);
+        }
+
+        for (Thread producer : producers) {
+            producer.join(1_000L);
         }
         long elapsedNs = System.nanoTime() - start;
         consumer.stop();
         consumerThread.join(1000);
+        if (consumerThread.isAlive()) {
+            throw new IllegalStateException("消费者线程未退出");
+        }
+
+        log(label, "  %d 个生产者与消费者均已完成", producerCount);
 
         double throughput = total / (elapsedNs / 1_000_000_000.0) / 1_000_000.0;
         log(label, "结束：耗时 %d ms, 吞吐 %.2f Mops/s, volatileWrites=%,d, cas=%,d",
@@ -290,23 +308,28 @@ public class SingleVsMultiProducerDemo {
 
     public static void main(String[] args) throws InterruptedException {
         log("main", "入口到达 classpath=%s", System.getProperty("java.class.path"));
-        final int bufferSize = 1024;
-        final long perProducer = 10_000_000L;
+        final int bufferSize = Integer.getInteger("disruptor.bufferSize", 1024);
+        final long perProducer = Long.getLong("disruptor.perProducer", 10_000_000L);
+        if (perProducer <= 0) {
+            throw new IllegalArgumentException("disruptor.perProducer 必须 > 0");
+        }
+        final long totalMessages = 4L * perProducer;
+        final long warmupPerProducer = Math.max(10_000L, perProducer / 10L);
 
         System.out.println("===== 单生产者 vs 多生产者 对比实验 =====");
         System.out.printf("bufferSize     = %d%n", bufferSize);
         System.out.printf("消息总数       = %,d (多生产者 = %d × %,d)%n",
-                4 * perProducer, 4, perProducer);
+                totalMessages, 4, perProducer);
         System.out.println();
 
-        // 跑两轮：第一轮 warmup（让 JIT 把代码热起来），第二轮正式计时
+        // 预热也保持单/多两边总消息数相同。
         log("main", "[warmup] 跑 1 轮预热，让 JIT 编译...");
-        runOnce("warmup-single", 1, perProducer / 10, bufferSize, false);
-        runOnce("warmup-multi", 4, perProducer / 10, bufferSize, true);
+        runOnce("warmup-single", 1, 4L * warmupPerProducer, bufferSize, false);
+        runOnce("warmup-multi", 4, warmupPerProducer, bufferSize, true);
         log("main", "[warmup] 完成。");
         System.out.println();
 
-        Result single = runOnce("单生产者", 1, 4 * perProducer, bufferSize, false);
+        Result single = runOnce("单生产者", 1, totalMessages, bufferSize, false);
         Result multi  = runOnce("多生产者", 4, perProducer, bufferSize, true);
 
         printTable(single, multi);

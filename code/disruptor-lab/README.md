@@ -85,7 +85,7 @@ mvn -q exec:java -Dexec.mainClass=io.ddia.disruptor.lab.falsesharing.ObjectLayou
 控制变量（两边完全相同）：bufferSize、消息总数、消费者线程数、消息体、warm-up 策略。
 自变量：生产者线程数（1 vs 4）+ 对应 Sequencer 实现。
 
-> 注意：下面的命令默认你**已经在 `code/disruptor-lab/` 目录里**。如果从仓库根 `/home/tomy/projects/java/ddia` 跑，要在前面加 `-f code/disruptor-lab/pom.xml`，否则 Maven 会报 *"there is no POM in this directory"*。
+> 注意：下面的命令默认你**已经在 `code/disruptor-lab/` 目录里**。如果从仓库根 `/home/tomy/projects/javaProjects/ddia` 跑，要在前面加 `-f code/disruptor-lab/pom.xml`，否则 Maven 会报 *"there is no POM in this directory"*。
 >
 > 如果是**新加的类**（比如对比 demo 这种），先跑一遍 `mvn compile` 把新类编译进 `target/classes`，否则 exec 会报 `ClassNotFoundException`：
 
@@ -98,17 +98,29 @@ cd code/disruptor-lab
 mvn -q compile exec:java -Dexec.mainClass=io.ddia.disruptor.lab.compare.SingleVsMultiProducerDemo
 ```
 
+快速跑 400 万条（单生产者 400 万；多生产者 4 × 100 万）：
+
+```
+mvn -q -f code/disruptor-lab/pom.xml compile exec:java \
+  -Dexec.mainClass=io.ddia.disruptor.lab.compare.SingleVsMultiProducerDemo \
+  -Ddisruptor.perProducer=1000000
+```
+
+多生产者实现使用两阶段协议：`next()` CAS 推进单调的 claimed cursor，`publish()`
+按“槽位 + 环次”写入原子 availability flag。消费者以 cursor 为扫描上界，再逐条检查
+availability，既支持乱序发布形成的空洞，也不会把上一圈残留状态误认为下一圈已经发布。
+
 预期看到（实际数字依机器而异，关键看**比值**）：
 
 ```
 ┌─────────────┬──────────────┬──────────────┐
 │     指标    │  单生产者     │  多生产者(4)  │
 ├─────────────┼──────────────┼──────────────┤
-│ 吞吐 Mops/s │        12.34 │         4.56 │
-│ CAS 次数    │             0 │    40,000,000 │
-│ CAS/消息    │         0.000 │         1.333 │
+│ 吞吐 Mops/s │        10.77 │         5.43 │
+│ CAS 次数    │             0 │    68,054,749 │
+│ CAS/消息    │         0.000 │         1.701 │
 └─────────────┴──────────────┴──────────────┘
-吞吐量比值：单 / 多 ≈ 2.7x
+吞吐量比值：单 / 多 ≈ 1.98x
 ```
 
 **怎么看这个表**：

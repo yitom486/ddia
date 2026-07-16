@@ -1,7 +1,5 @@
 package io.ddia.disruptor.lab.compare;
 
-import java.util.concurrent.locks.LockSupport;
-
 /**
  * 单生产者实现：实现 Sequencer 接口，暴露计数器。
  *
@@ -39,7 +37,7 @@ public class SingleProducerSequencer implements Sequencer {
         if (wrapPoint > cached || cached > nextValue) {
             long min = minGating();
             while (wrapPoint > min) {
-                LockSupport.parkNanos(1L);
+                Thread.onSpinWait();
                 min = minGating();
             }
             cachedGating = min;
